@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Base Invaders</title>
+  <style>
+    :root {
+      --play-w: 800px;
+      --play-h: 600px;
+    }
+    body {
+      margin: 0;
+      background: black;
+      color: white;
+      font-family: monospace;
+      overflow: hidden;
+    }
+    #hud {
+      position: fixed;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      text-align: center;
+      z-index: 3;
+      user-select: none;
+      pointer-events: none;
+    }
+    #gameCanvas {
+      display: block;
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      background: black;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <span id="score">Score: 0</span> |
+    <span id="level">Level: 1</span> |
+    <span id="lives">❤️❤️❤️</span>
+  </div>
+  <canvas id="gameCanvas"></canvas>
+
+  <script>
+    // ---------------- Canvas & Playfield ----------------
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    const scoreEl = document.getElementById("score");
+    const levelEl = document.getElementById("level");
+    const livesEl = document.getElementById("lives");
+
+    const PLAY_W = 800;
+    const PLAY_H = 600;
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    function playRect() {
+      const x = (canvas.width - PLAY_W) / 2;
+      const y = (canvas.height - PLAY_H) / 2;
+      return { x, y, w: PLAY_W, h: PLAY_H };
+    }
+
+    // ---------------- Game State ----------------
+    let score = 0, maxScore = 0;
+    let level = 1, maxLevel = 1;
+    let lives = 3;
+
+    let typedBuffer = "";
+    let bufferAlpha = 0;
+    let bufferClearTimeout = null;
+
+    let gameRunning = false;
+    let gameOver = false;
+
+    // Nibble stats
+    const totalCounts = new Map();   // nibble -> total appearances
+    const correctCounts = new Map(); // nibble -> correct hits
+
+    // ---------------- Helpers ----------------
+    function groupBits(bin) {
+      // pad to nibble, group from LSB (right) side
+      const padded = bin.padStart(Math.ceil(bin.length / 4) * 4, "0");
+      const rev = padded.split("").reverse().join("");
+      const grouped = rev.replace(/(.{4})(?=.)/g, "$1 ");
+      return grouped.split("").reverse().join("");
+    }
+    function normalizeHex(str) {
+      let s = str.toUpperCase();
+      if (s.length === 1) s = "0" + s;
+      return s;
+    }
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    function updateLivesDisplay() {
+      const full = "❤️";
+      const empty = "🤍";
+      livesEl.textContent = full.repeat(lives) + empty.repeat(3 - lives);
+    }
+
+    // ---------------- Background (stars / planet / moon) ----------------
+    class Star {
+      constructor() { this.reset(true); }
+      reset(randomY = false) {
+        this.x = Math.random() * canvas.width;
+        this.y = randomY ? Math.random() * canvas.height : 0;
+        this.size = Math.random() * 2 + 1;
+        this.speed = Math.random() * 0.5 + 0.2;
+        this.alpha = Math.random() * 0.5 + 0.5;
+      }
+      update(mult = 1) {
+        this.y += this.speed * mult;
+        if (this.y > canvas.height) this.reset(false);
+      }
+      draw() {
+        ctx.globalAlpha = this.alpha;
+        ctx.fillStyle = "white";
+        ctx.fillRect(this.x, this.y, this.size, this.size);
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    class Planet {
+      constructor() { this.reset(); }
+      reset() {
+        this.x = Math.random() * canvas.width;
+        this.y = -100;
+        this.size = Math.random() * 15 + 10; // small
+        this.speed = Math.random() * 0.1 + 0.05;
+        this.color = `hsl(${Math.random() * 360}, 70%, 50%)`;
+      }
+      update(mult = 1) {
+        this.y += this.speed * mult;
+        if (this.y - this.size > canvas.height) this.reset();
+      }
+      draw() {
+        const g = ctx.createRadialGradient(
+          this.x - this.size/3, this.y - this.size/3, this.size/5,
+          this.x, this.y, this.size
+        );
+        g.addColorStop(0, "white");
+        g.addColorStop(1, this.color);
+        ctx.globalAlpha = 0.15;
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    class Moon {
+      constructor() { this.reset(); }
+      reset() {
+        this.x = Math.random() * canvas.width;
+        this.y = -100;
+        this.size = Math.random() * 20 + 15;
+        this.speed = Math.random() * 0.1 + 0.05;
+        // craters relative
+        this.craters = [];
+        for (let i = 0; i < 5; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const r = Math.random() * this.size * 0.6;
+          const dx = Math.cos(a) * r;
+          const dy = Math.sin(a) * r;
+          const cr = this.size * 0.1 + Math.random() * this.size * 0.1;
+          this.craters.push({ dx, dy, r: cr });
+        }
+      }
+      update(mult = 1) {
+        this.y += this.speed * mult;
+        if (this.y - this.size > canvas.height) this.reset();
+      }
+      draw() {
+        const g = ctx.createRadialGradient(
+          this.x - this.size/4, this.y - this.size/4, this.size/5,
+          this.x, this.y, this.size
+        );
+        g.addColorStop(0, "#ddd");
+        g.addColorStop(1, "#666");
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = "rgba(50,50,50,0.5)";
+        this.craters.forEach(c => {
+          ctx.beginPath();
+          ctx.arc(this.x + c.dx, this.y + c.dy, c.r, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+    }
+
+    // ---------------- Explosion Particles ----------------
+    class Particle {
+      constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.vx = (Math.random() - 0.5) * 6;
+        this.vy = (Math.random() - 0.5) * 6;
+        this.life = 30 + Math.random() * 20;
+        this.alpha = 1;
+        this.color = `hsl(${Math.random() * 360}, 100%, 50%)`;
+      }
+      update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.vy += 0.1;
+        this.life--;
+        this.alpha = Math.max(0, this.life / 50);
+      }
+      draw() {
+        ctx.globalAlpha = this.alpha;
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    // ---------------- Invader / Ship / Laser ----------------
+    class Invader {
+      constructor(binary, x) {
+        this.binaryRaw = binary;
+        this.binary = groupBits(binary);
+        this.hex = parseInt(binary, 2).toString(16).toUpperCase().padStart(2, "0");
+        this.y = playRect().y; // start at top of playfield
+        this.alive = true;
+        this.speed = 0.2;
+
+        const pr = playRect();
+        ctx.font = "20px monospace";
+        const tw = ctx.measureText(this.binary).width;
+        this.x = clamp(x, pr.x + tw/2, pr.x + pr.w - tw/2);
+
+        // Count totals for each nibble on spawn
+        for (let n of this.hex) {
+          totalCounts.set(n, (totalCounts.get(n) || 0) + 1);
+        }
+      }
+      update() {
+        this.y += this.speed;
+        const pr = playRect();
+        const missY = pr.y + pr.h - 20;
+        if (this.y > missY) {
+          this.alive = false;
+          score -= 10;
+          lives -= 1;
+          updateLivesDisplay();
+          clearTypedBuffer();
+          if (lives <= 0 || score < 0) endGame();
+          scoreEl.textContent = "Score: " + score;
+        }
+      }
+      draw() {
+        ctx.font = "20px monospace";
+        ctx.fillStyle = "lime";
+        const tw = ctx.measureText(this.binary).width;
+        ctx.fillText(this.binary, this.x - tw/2, this.y);
+      }
+    }
+
+    class Ship {
+      constructor() {
+        const pr = playRect();
+        this.x = pr.x + pr.w / 2;
+        this.y = pr.y + pr.h - 40;
+      }
+      recalcPosition() {
+        const pr = playRect();
+        this.y = pr.y + pr.h - 40;
+      }
+      draw() {
+        ctx.fillStyle = "cyan";
+        ctx.beginPath();
+        ctx.moveTo(this.x, this.y);
+        ctx.lineTo(this.x - 15, this.y + 20);
+        ctx.lineTo(this.x + 15, this.y + 20);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+
+    class Laser {
+      constructor(x, y, target, answer) {
+        this.x = x;
+        this.y = y;
+        this.target = target;
+        this.answer = answer;
+        this.active = true;
+        this.speed = 8;
+      }
+      update() {
+        if (!this.target.alive) { this.active = false; return; }
+        const dx = this.target.x - this.x;
+        const dy = this.target.y - this.y;
+        const d  = Math.hypot(dx, dy);
+        if (d < 12) {
+          if (normalizeHex(this.answer) === this.target.hex) {
+            this.target.alive = false;
+            spawnExplosion(this.target.x, this.target.y);
+            score += 10;
+            if (score > maxScore) maxScore = score;
+            if (lives < 3) { lives += 1; updateLivesDisplay(); }
+            scoreEl.textContent = "Score: " + score;
+
+            // Count corrects for each nibble
+            for (let n of this.target.hex) {
+              correctCounts.set(n, (correctCounts.get(n) || 0) + 1);
+            }
+
+            // Every 50 points, advance level
+            if (score > 0 && score % 50 === 0) {
+              level++;
+              if (level > maxLevel) maxLevel = level;
+              levelEl.textContent = "Level: " + level;
+              spawnInterval = Math.max(2000, spawnInterval - 500);
+            }
+          }
+          this.active = false;
+        } else {
+          this.x += (dx / d) * this.speed;
+          this.y += (dy / d) * this.speed;
+        }
+      }
+      draw() {
+        ctx.strokeStyle = "red";
+        ctx.beginPath();
+        ctx.moveTo(this.x, this.y);
+        ctx.lineTo(this.x, this.y + 10);
+        ctx.stroke();
+      }
+    }
+
+    // ---------------- Collections & Spawning ----------------
+    let invaders = [];
+    let lasers = [];
+    let particles = [];
+    let ship = new Ship();
+
+    // Background collections
+    let stars = Array.from({ length: 150 }, () => new Star());
+    let planet = new Planet();
+    let moon = new Moon();
+
+    let spawnTimer = 0;           // ms timestamp
+    let spawnInterval = 4000;     // slower start
+
+    function getInvaderSpeed() {
+      const base = 0.2;
+      const scale = Math.max(0.05, score / 200); // higher score → faster; losing slows next
+      return base + level * 0.05 + scale;
+    }
+
+    function spawnInvader() {
+      const bits = Math.floor(Math.random() * 4) + 4; // 4–7 bits
+      const binary = (Math.floor(Math.random() * (1 << bits)))
+        .toString(2)
+        .padStart(bits, "0");
+      const pr = playRect();
+      const x = pr.x + Math.random() * pr.w;
+      invaders.push(new Invader(binary, x));
+    }
+
+    function spawnExplosion(x, y) {
+      for (let i = 0; i < 30; i++) particles.push(new Particle(x, y));
+      playExplosion(); // sound
+    }
+
+    // ---------------- Audio (Web Audio API) ----------------
+    let audioCtx = null;
+    function getAudioCtx() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+      return audioCtx;
+    }
+    function playLaserPew() {
+      const ac = getAudioCtx();
+      const now = ac.currentTime;
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = "square";
+      osc.frequency.setValueAtTime(900, now);
+      osc.frequency.exponentialRampToValueAtTime(350, now + 0.12);
+      gain.gain.setValueAtTime(0.12, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+      osc.connect(gain); gain.connect(ac.destination);
+      osc.start(now); osc.stop(now + 0.13);
+    }
+    function playExplosion() {
+      const ac = getAudioCtx();
+      const now = ac.currentTime;
+      // noise burst
+      const bufferSize = 0.2 * ac.sampleRate;
+      const buffer = ac.createBuffer(1, bufferSize, ac.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) data[i] = (Math.random()*2-1) * (1 - i / bufferSize);
+      const noise = ac.createBufferSource();
+      noise.buffer = buffer;
+      const bp = ac.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.value = 800;
+      const nGain = ac.createGain();
+      nGain.gain.setValueAtTime(0.3, now);
+      nGain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+      noise.connect(bp); bp.connect(nGain); nGain.connect(ac.destination);
+      noise.start(now); noise.stop(now + 0.3);
+      // low boom
+      const osc = ac.createOscillator();
+      const oGain = ac.createGain();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(220, now);
+      osc.frequency.exponentialRampToValueAtTime(80, now + 0.25);
+      oGain.gain.setValueAtTime(0.2, now);
+      oGain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+      osc.connect(oGain); oGain.connect(ac.destination);
+      osc.start(now); osc.stop(now + 0.26);
+    }
+
+    // ---------------- Buffer Overlay ----------------
+    function drawBufferOverlay() {
+      if (bufferAlpha > 0 && typedBuffer.length > 0) {
+        const pr = playRect();
+        ctx.save();
+        ctx.globalAlpha = bufferAlpha;
+        ctx.fillStyle = "white";
+        ctx.font = "48px monospace";
+        const tw = ctx.measureText(typedBuffer).width;
+        ctx.fillText(typedBuffer, pr.x + pr.w/2 - tw/2, pr.y + pr.h/2);
+        ctx.restore();
+      }
+      if (bufferAlpha > 0) bufferAlpha = Math.max(0, bufferAlpha - 0.01);
+    }
+    function resetBufferClearTimer() {
+      if (bufferClearTimeout) clearTimeout(bufferClearTimeout);
+      bufferClearTimeout = setTimeout(() => { typedBuffer = ""; }, 2200);
+    }
+    function clearTypedBuffer() {
+      typedBuffer = "";
+      bufferAlpha = 0;
+      if (bufferClearTimeout) { clearTimeout(bufferClearTimeout); bufferClearTimeout = null; }
+    }
+
+    // ---------------- Screens & Histogram ----------------
+    let hoverIndex = -1, mouseX = 0, mouseY = 0;
+    canvas.addEventListener("mousemove", e => { mouseX = e.clientX; mouseY = e.clientY; });
+
+    function drawStartScreen() {
+      const pr = playRect();
+      ctx.fillStyle = "white";
+      ctx.font = "36px monospace";
+      const msg = "Press SPACE to Start";
+      const tw = ctx.measureText(msg).width;
+      ctx.fillText(msg, pr.x + pr.w/2 - tw/2, pr.y + pr.h/2);
+    }
+
+    function drawPlayfieldFrame() {
+      const pr = playRect();
+      ctx.strokeStyle = "rgba(255,255,255,0.2)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(pr.x, pr.y, pr.w, pr.h);
+    }
+
+    function drawHistogram() {
+      const pr = playRect();
+      ctx.fillStyle = "rgba(0,0,0,0.85)";
+      ctx.fillRect(pr.x, pr.y, pr.w, pr.h);
+
+      ctx.fillStyle = "white";
+      ctx.font = "32px monospace";
+      const title = "GAME OVER";
+      const tw = ctx.measureText(title).width;
+      ctx.fillText(title, pr.x + pr.w/2 - tw/2, pr.y + 40);
+
+      ctx.font = "16px monospace";
+      ctx.fillText(`Score: ${score}`, pr.x + 20, pr.y + 70);
+      ctx.fillText(`Max Score: ${maxScore}`, pr.x + 20, pr.y + 90);
+      ctx.fillText(`Max Level: ${maxLevel}`, pr.x + 20, pr.y + 110);
+
+      const labels = "0123456789ABCDEF".split("");
+      const chartX = pr.x + 60, chartY = pr.y + 150;
+      const chartW = pr.w - 100, chartH = pr.h - 200;
+
+      const totals  = labels.map(k => totalCounts.get(k)   || 0);
+      const correct = labels.map(k => correctCounts.get(k) || 0);
+      const misses  = totals.map((t,i) => t - correct[i]);
+      const maxCount = Math.max(1, ...totals);
+
+      const barGap = 2;
+      const barW = (chartW - (labels.length - 1) * barGap) / labels.length;
+
+      // axes + y label
+      ctx.strokeStyle = "white";
+      ctx.beginPath();
+      ctx.moveTo(chartX, chartY);
+      ctx.lineTo(chartX, chartY + chartH);
+      ctx.lineTo(chartX + chartW, chartY + chartH);
+      ctx.stroke();
+      ctx.fillText("Count", chartX - 40, chartY - 10);
+
+      hoverIndex = -1;
+
+      for (let i = 0; i < labels.length; i++) {
+        const totalH = (totals[i]  / maxCount) * (chartH - 20);
+        const hitH   = (correct[i] / maxCount) * (chartH - 20);
+        const missH  = totalH - hitH;
+        const bx = chartX + i * (barW + barGap);
+        const by = chartY + chartH;
+
+        // misses bottom (red)
+        ctx.fillStyle = "rgba(255,80,80,0.9)";
+        ctx.fillRect(bx, by - missH, barW, missH);
+
+        // hits stacked on top (green)
+        ctx.fillStyle = "rgba(80,255,120,0.9)";
+        ctx.fillRect(bx, by - totalH, barW, hitH);
+
+        // x labels
+        ctx.fillStyle = "white";
+        ctx.fillText(labels[i], bx + barW/2 - 4, chartY + chartH + 15);
+
+        // % label above bar (if any data)
+        if (totals[i] > 0) {
+          const pct = Math.round((correct[i] / totals[i]) * 100);
+          ctx.fillText(`${pct}%`, bx + barW/2 - 12, by - totalH - 5);
+        }
+
+        // hover detection (only within bar height)
+        if (mouseX > bx && mouseX < bx + barW && mouseY > by - totalH && mouseY < by) {
+          hoverIndex = i;
+        }
+      }
+
+      // tooltip
+      if (hoverIndex >= 0) {
+        const hits = correct[hoverIndex], mis = misses[hoverIndex];
+        const text = `Hex ${labels[hoverIndex]}  Hits:${hits}  Misses:${mis}`;
+        const twt = ctx.measureText(text).width + 8;
+        ctx.fillStyle = "black";
+        ctx.fillRect(mouseX, mouseY - 20, twt, 20);
+        ctx.strokeStyle = "white";
+        ctx.strokeRect(mouseX, mouseY - 20, twt, 20);
+        ctx.fillStyle = "white";
+        ctx.fillText(text, mouseX + 4, mouseY - 5);
+      }
+
+      // restart hint
+      ctx.font = "16px monospace";
+      const hint = "Press SPACE to Restart";
+      const twh = ctx.measureText(hint).width;
+      ctx.fillText(hint, pr.x + pr.w/2 - twh/2, pr.y + pr.h - 15);
+    }
+
+    function endGame() { gameOver = true; }
+
+    // ---------------- Main Loop ----------------
+    function gameLoop(ts) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // window-filling background
+      stars.forEach(s => { s.update(1); s.draw(); });
+      planet.update(1); planet.draw();
+      moon.update(1);   moon.draw();
+
+      // playfield frame + ship baseline
+      drawPlayfieldFrame();
+      ship.recalcPosition();
+
+      if (!gameRunning) {
+        drawStartScreen();
+        requestAnimationFrame(gameLoop);
+        return;
+      }
+
+      if (gameOver) {
+        drawHistogram();
+        requestAnimationFrame(gameLoop);
+        return;
+      }
+
+      // Apply global speed to all invaders (existing + new)
+      const invSpeed = getInvaderSpeed();
+      invaders.forEach(inv => { inv.speed = invSpeed; inv.update(); });
+      invaders = invaders.filter(inv => inv.alive);
+
+      // Draw invaders (clipped to playfield)
+      const pr = playRect();
+      ctx.save();
+      ctx.beginPath(); ctx.rect(pr.x, pr.y, pr.w, pr.h); ctx.clip();
+      invaders.forEach(inv => inv.draw());
+      ctx.restore();
+
+      // Lasers + particles
+      lasers.forEach(l => l.update());
+      lasers = lasers.filter(l => l.active);
+      lasers.forEach(l => l.draw());
+
+      particles.forEach(p => p.update());
+      particles = particles.filter(p => p.life > 0);
+      particles.forEach(p => p.draw());
+
+      // Ship auto-track first invader
+      if (invaders.length > 0) {
+        ship.x += (invaders[0].x - ship.x) * 0.05;
+      }
+      ship.draw();
+
+      // Buffer overlay
+      drawBufferOverlay();
+
+      // Spawning
+      if (ts > spawnTimer + spawnInterval) {
+        spawnInvader();
+        spawnTimer = ts;
+      }
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    // ---------------- Input ----------------
+    document.addEventListener("keydown", e => {
+      // start / restart
+      if (!gameRunning && e.key === " ") { startNewGame(); return; }
+      if (gameOver && e.key === " ")     { startNewGame(); return; }
+
+      if (!gameRunning) return;
+
+      if (/^[0-9a-fA-F]$/.test(e.key)) {
+        typedBuffer += e.key.toUpperCase();
+        if (typedBuffer.length > 16) typedBuffer = typedBuffer.slice(-16);
+        bufferAlpha = 1;
+        resetBufferClearTimer();
+      }
+
+      if (e.key === " " || e.key === "Enter") {
+        if (invaders.length > 0) {
+          const target = invaders[0];
+          lasers.push(new Laser(ship.x, ship.y, target, typedBuffer));
+          playLaserPew();
+        }
+        typedBuffer = "";
+        bufferAlpha = 1;
+        resetBufferClearTimer();
+        e.preventDefault();
+      }
+
+      if (e.key === "Backspace") {
+        typedBuffer = typedBuffer.slice(0, -1);
+        bufferAlpha = 1;
+        resetBufferClearTimer();
+        e.preventDefault();
+      }
+    });
+
+    function clearTypedBuffer(){ typedBuffer = ""; bufferAlpha = 0; if (bufferClearTimeout){ clearTimeout(bufferClearTimeout); bufferClearTimeout = null; } }
+
+    // ---------------- Start / Reset ----------------
+    function startNewGame() {
+      gameRunning = true;
+      gameOver = false;
+
+      score = 0; maxScore = 0;
+      level = 1; maxLevel = 1;
+      lives = 3; updateLivesDisplay();
+
+      typedBuffer = ""; bufferAlpha = 0;
+      if (bufferClearTimeout) clearTimeout(bufferClearTimeout); bufferClearTimeout = null;
+
+      invaders = []; lasers = []; particles = [];
+      totalCounts.clear(); correctCounts.clear();
+
+      spawnInterval = 4000;
+      spawnTimer = performance.now();
+
+      scoreEl.textContent = "Score: 0";
+      levelEl.textContent = "Level: 1";
+    }
+
+    // ---------------- Boot ----------------
+    updateLivesDisplay();
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>
